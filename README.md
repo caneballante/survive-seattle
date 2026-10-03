@@ -1,6 +1,26 @@
 # Survive Seattle
 
-A playable browser life-sim about coffee, work, rent, status, and unreasonable optimism. The game is built with TypeScript, Vite, and Phaser 3. All artwork is generated at runtime from original shapes and text.
+The default presentation is now a fixed-camera, low-poly Three.js diorama. The original Phaser side-scroller is intentionally retained as a temporary legacy renderer.
+
+- 3D diorama: `http://127.0.0.1:5174/`
+- Legacy side-scroller: `http://127.0.0.1:5174/?renderer=legacy`
+
+## 3D slice architecture
+
+Simulation, balance, first-show scoring, audio, weather selection, calendar state, and DOM UI remain renderer-independent under `src/game`. Presentation lives under `src/three`:
+
+- `CharacterFactory` assembles reusable articulated characters, held props, expressive poses, and a distance-driven gait so feet stay synchronized with ground travel.
+- `BuildingFactory` and `StorefrontFactory` build shells, facades, displays, and interiors.
+- `PropFactory` supplies street furniture, foliage, puddles, signs, and the guitar case.
+- `StreetSectionFactory` composes the playable block and its collision volumes.
+- `TimeOfDaySystem` and `WeatherSystem` translate the existing simulation into light, haze, moving clouds, intermittent rain, windows, and Rainier visibility.
+- `InteractionIndicator` provides the subtle ground cue shared by people and locations.
+- `ThreeWorld` owns movement, animation, camera follow, flyer handoffs, the crowd director, and the physical show presentation. Pedestrians repeatedly choose reasons to cross the block, visit stores and the park, meet each other, react to the promoter, and then choose another goal.
+- `pedestrians.ts` holds renderer-independent crowd, disposition, goal, and timing weights plus deterministic selection helpers.
+
+Add a district by composing more factory output and adding renderer-local location points; do not put scoring or balance rules in a factory. Add character variety through `CharacterVariant` rather than cloning whole models. New held items should be attached in `CharacterFactory` and selected from game state. The 2D renderer should remain available until the 3D slice has received a full gameplay/balance pass.
+
+A playable browser life-sim about coffee, work, rent, status, music, and unreasonable optimism. The game is built with TypeScript and Vite, using Three.js for the default diorama and Phaser 3 for the legacy renderer. The 3D street, buildings, atmosphere, props, and cast are generated at runtime from reusable low-poly parts.
 
 ## Run it
 
@@ -15,12 +35,13 @@ Open the local URL printed by Vite. On an iPhone, use Safari or Chrome in landsc
 
 ## Controls
 
-- Walk: `A` / `D` or left / right arrow keys
+- Walk: `WASD` or the four arrow keys
 - Run: hold `Shift` while moving; running spends Energy
 - Interact: `E` or `Space`
+- During a show: `Left` / `Right` works that side of the crowd, `Space` hits the closing gold ring, `Shift` spends 35 Groove on a flourish, and three Perfect hits unlock an `E` power chord
 - Close a menu: `Escape`
 - Development panel: `F2` or backtick
-- Touch: left, right, **Run**, and **Interact** buttons appear on phones and smaller landscape screens
+- Touch: a four-direction pad, **Run**, and **Interact** buttons appear on phones and smaller landscape screens
 - **Sound: on/off** mutes or resumes the soundtrack and effects
 - **Reset game** restarts Year 1, Spring, Day 1
 
@@ -61,15 +82,15 @@ interior changes without moving invisible geographic walls.
 Far construction boundaries remain visible at the ends to show that Seattle
 continues beyond the current playable slice.
 
-## First-day loop
+## Miniature first-show loop
 
-1. Find coffee.
-2. Inspect **Jobs, Probably** and accept the Cascadia Solutions role.
-3. Work a shift.
-4. Return to the Tiny Apartment and sleep.
-5. On Day 2, revisit distant storefronts as new possibilities develop.
+1. Book the 8 PM street gig and take ten flyers.
+2. Walk the neighborhood and physically hand flyers to people. Some accept and some refuse.
+3. Return to **Mossy Pocket Park** when the crowd feels large enough, or risk an underprepared show.
+4. Read the 3–2–1 pulse, hit the closing gold ring, work both sides of the crowd, and turn streaks into visible walk-ins and unlockable moves.
+5. Perfect hits throw coins into the guitar case. Neglected crowd members can visibly leave, and the result screen explains the timing, streak, final crowd balance, walk-ins, and walk-outs behind the score.
 
-Valid interactions can happen in another order. Opportunities guide rather than gate exploration.
+The show can be started below the six-person target, but the smaller opening crowd makes the timing game less forgiving and reduces the likely payoff. The rest of the life-sim interactions remain available around this loop.
 
 ## New interactions
 
@@ -83,11 +104,15 @@ Valid interactions can happen in another order. Opportunities guide rather than 
 
 The accelerated calendar has five days per season and twenty days per year. Seasonal boundaries reset seasonal limits and charge the current rent.
 
-## Street pressure
+## Street population
 
-The player now stays on one grounded side-scrolling plane. The crowd can still
-occupy two visual depths, but up/down movement is reserved for a future climb,
-crouch, or avoidance action. The first crowd pass adds four data-driven encounters:
+The player stays on one grounded side-scrolling plane; up/down movement remains
+reserved for a future climb, crouch, or avoidance action. The earlier collision
+encounters are parked while the core music loop is being tested. Booking the show
+instead populates the street with a programmatic cast of flyer prospects whose
+silhouettes, coats, hats, bags, headphones, and reactions are layered at runtime.
+
+The encounter architecture still contains four data-driven prototypes for later use:
 
 - A phone walker drifts between lanes and turns collisions into time or social costs
 - An aggressive panhandler intercepts the player and offers Money, time, or Energy responses
@@ -130,6 +155,17 @@ The panel can:
 
 The panel is hidden by default and does not affect normal phone play.
 
+## Pedestrian Lab
+
+Select **Tune crowd** or press `F3` to open the live pedestrian testing table. It exposes:
+
+- The 5 / 10 / 60 / 20 / 5 density spread and each tier's population range
+- The interested, interruptible, avoidant, and fleeing prospect mix and acceptance rates
+- Coffee, music shop, job board, park, conversation, and pass-through goal weights
+- Crowd-cycle, store-dwell, conversation, walking, running, and awareness timing
+
+**Apply & reroll crowd** updates active unapproached people as well as future arrivals. These development settings persist separately from player progress and can be restored with **Restore defaults**.
+
 ## Add content
 
 ### Add a location
@@ -162,7 +198,7 @@ npm test
 npm run build
 ```
 
-Tests cover the original Day 1 logic plus open-world bounds, visible
+Tests cover the original Day 1 logic plus the first-show preparation and scoring cycle, open-world bounds, visible
 aspirations, Energy, street encounter resolution, carried-coffee loss, travel
 time, daily weather rotation, interaction requirements and costs, daily and
 seasonal limits, inventory, calendar transitions, event eligibility, cooldowns,
@@ -171,6 +207,7 @@ tailoring, rent persistence, event modifiers, and opportunity direction.
 ## Architecture
 
 - `src/game/state.ts` — statistics, calendar, jobs, inventory, interactions, regions, and event application
+- `src/game/gig.ts` — street-show constants and deterministic preparation/performance scoring
 - `src/game/interactions.ts` — reusable interaction catalog
 - `src/game/cityEvents.ts` — event catalog, eligibility, cooldowns, and tailored selection
 - `src/game/regions.ts` — open street bounds and content-progression stages
@@ -180,7 +217,8 @@ tailoring, rent persistence, event modifiers, and opportunity direction.
 - `src/game/weather.ts` — deterministic seasonally varied daily weather
 - `src/game/atmosphere.ts` — time- and weather-driven palette sampling
 - `src/game/opportunities.ts` — priority-based guidance lifecycle
-- `src/game/SeattleScene.ts` — generated art, crowd movement, lanes, camera, weather, and lighting
+- `src/game/SeattleScene.ts` — temporary legacy Phaser renderer and its 2D show presentation
+- `src/three/ThreeWorld.ts` — default 3D movement, interactions, camera, pedestrians, and show presentation
 - `src/ui.ts` — HUD, menus, dialogue, and touch controls
 - `src/debugPanel.ts` — development-only inspection and triggering tools
 

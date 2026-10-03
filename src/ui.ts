@@ -1,5 +1,5 @@
 import { AudioManager } from "./audio";
-import type { SeattleScene } from "./game/SeattleScene";
+import type { SceneController } from "./game/SceneController";
 import { DebugPanel } from "./debugPanel";
 import { GameEvents } from "./game/events";
 import { INTERACTION_BY_ID } from "./game/interactions";
@@ -7,7 +7,9 @@ import { LOCATION_BY_ID } from "./game/locations";
 import { GameState, AVAILABLE_JOB, formatTime } from "./game/state";
 import { STREET_ENCOUNTER_BY_ID } from "./game/streetEncounters";
 import type { ActionResult, GameSnapshot, LocationId, Opportunity } from "./game/types";
+import type { PedestrianTuningStore } from "./game/pedestrians";
 import { weatherLabel } from "./game/weather";
+import { PedestrianLab } from "./pedestrianLab";
 
 const COFFEE_CHOICES = [
   "Rain-Adjusted Americano",
@@ -31,9 +33,10 @@ export class GameUI {
   private readonly modal: HTMLElement;
   private readonly toast: HTMLElement;
   private readonly cue: HTMLElement;
+  private readonly gigStatus: HTMLElement;
   private readonly menuPanel: HTMLElement;
   private readonly touchControls: HTMLElement;
-  private scene: SeattleScene | null = null;
+  private scene: SceneController | null = null;
   private modalOpen = true;
   private toastTimer = 0;
 
@@ -42,23 +45,28 @@ export class GameUI {
     private readonly state: GameState,
     private readonly events: GameEvents,
     private readonly audio: AudioManager,
+    pedestrianTuning: PedestrianTuningStore,
   ) {
     mount.innerHTML = `
       <section class="game-frame" aria-label="Survive Seattle">
-        <div id="game-canvas" aria-label="A side-scrolling Seattle street"></div>
+        <div id="game-canvas" aria-label="A three-quarter-view miniature Seattle neighborhood"></div>
         <div class="rain-vignette" aria-hidden="true"></div>
         <header class="hud" aria-label="Player statistics"></header>
+        <aside class="gig-status" aria-live="polite"></aside>
         <div class="opportunity-cue" aria-live="polite"></div>
         <div class="interaction-prompt" aria-live="polite"></div>
         <div class="toast" role="status" aria-live="polite"></div>
         <nav class="game-tools" aria-label="Game controls">
+          <button class="icon-button crowd-tuning-button" type="button">Tune crowd</button>
           <button class="icon-button mute-button" type="button" aria-pressed="false">Sound: on</button>
           <button class="icon-button reset-button" type="button">Reset game</button>
         </nav>
         <div class="touch-controls" aria-label="Touch controls">
           <div class="move-controls">
-            <button class="touch-button" data-direction="-1" type="button" aria-label="Walk left">◀</button>
-            <button class="touch-button" data-direction="1" type="button" aria-label="Walk right">▶</button>
+            <button class="touch-button touch-up" data-depth="-1" type="button" aria-label="Walk away">▲</button>
+            <button class="touch-button touch-left" data-direction="-1" type="button" aria-label="Walk left">◀</button>
+            <button class="touch-button touch-down" data-depth="1" type="button" aria-label="Walk toward camera">▼</button>
+            <button class="touch-button touch-right" data-direction="1" type="button" aria-label="Walk right">▶</button>
           </div>
           <div class="action-controls">
             <button class="touch-button sprint-button" type="button">RUN</button>
@@ -82,15 +90,17 @@ export class GameUI {
     this.menuPanel = mount.querySelector(".menu-panel") as HTMLElement;
     this.toast = mount.querySelector(".toast") as HTMLElement;
     this.cue = mount.querySelector(".opportunity-cue") as HTMLElement;
+    this.gigStatus = mount.querySelector(".gig-status") as HTMLElement;
     this.touchControls = mount.querySelector(".touch-controls") as HTMLElement;
 
     this.bindControls();
     this.bindEvents();
     this.state.subscribe((snapshot) => this.renderHUD(snapshot));
     new DebugPanel(this.root, this.state);
+    new PedestrianLab(this.root, pedestrianTuning, this.events);
   }
 
-  attachScene(scene: SeattleScene): void {
+  attachScene(scene: SceneController): void {
     this.scene = scene;
     scene.setMenuOpen(true);
     this.showIntro();
@@ -99,7 +109,7 @@ export class GameUI {
   private bindEvents(): void {
     this.events.on("focus", ({ locationId, label }) => {
       this.prompt.textContent = label;
-      this.prompt.classList.toggle("visible", locationId !== null);
+      this.prompt.classList.toggle("visible", locationId !== null || label.length > 0);
     });
     this.events.on("interact", ({ locationId }) => {
       this.audio.play("ui-click");
@@ -108,6 +118,25 @@ export class GameUI {
     this.events.on("streetEncounter", ({ actorId, encounterId }) => {
       this.audio.play("notice");
       this.openStreetEncounter(actorId, encounterId);
+    });
+    this.events.on("flyerResult", ({ accepted }) => {
+      this.audio.play(accepted ? "success" : "ui-click");
+      this.showToast(accepted ? "♫ New listener" : "Not this one", 850);
+    });
+    this.events.on("gigComplete", ({ result }) => {
+      this.audio.play(result.score >= 55 ? "success" : "error");
+      this.showMenu(
+        `${result.rating} · ${result.score}`,
+        `${result.summary}\n\n${result.breakdown}\n\nPreparation, timing, visible walk-ins, and keeping both sides engaged shaped the result.`,
+        [
+          {
+            label: `Take the $${result.tips} and face tomorrow`,
+            kind: "primary",
+            action: () => this.closeMenu(),
+          },
+        ],
+        "Street gig complete",
+      );
     });
     this.events.on("cue", ({ opportunity, direction }) => {
       if (!opportunity || !direction || direction === "visible") {
@@ -138,6 +167,19 @@ export class GameUI {
       button.addEventListener("pointerup", stopWalking);
       button.addEventListener("pointercancel", stopWalking);
       button.addEventListener("lostpointercapture", stopWalking);
+    });
+    const stopDepth = (): void => this.scene?.setTouchDepth(0);
+    this.touchControls.querySelectorAll<HTMLButtonElement>("[data-depth]").forEach((button) => {
+      const direction = Number(button.dataset.depth);
+      button.addEventListener("pointerdown", (event) => {
+        event.preventDefault();
+        button.setPointerCapture(event.pointerId);
+        this.scene?.nudgePlayerDepth(direction);
+        this.scene?.setTouchDepth(direction);
+      });
+      button.addEventListener("pointerup", stopDepth);
+      button.addEventListener("pointercancel", stopDepth);
+      button.addEventListener("lostpointercapture", stopDepth);
     });
     this.touchControls
       .querySelector<HTMLButtonElement>(".interact-button")
@@ -213,26 +255,56 @@ export class GameUI {
           : ""
       }
     `;
+    this.renderGigStatus(snapshot);
+    const sprintButton = this.touchControls.querySelector<HTMLButtonElement>(".sprint-button");
+    if (sprintButton) sprintButton.textContent = snapshot.gig.phase === "performing" ? "MOVE" : "RUN";
+  }
+
+  private renderGigStatus(snapshot: Readonly<GameSnapshot>): void {
+    const gig = snapshot.gig;
+    this.gigStatus.classList.toggle("visible", gig.phase !== "unbooked");
+    if (gig.phase === "unbooked") {
+      this.gigStatus.innerHTML = "";
+      return;
+    }
+    if (gig.phase === "promoting") {
+      const ready = gig.recruitedFans >= gig.targetFans;
+      this.gigStatus.innerHTML = `
+        <div class="gig-kicker">TONIGHT · ${formatTime(gig.showTime)}</div>
+        <strong>${ready ? "A CROWD IS FORMING" : "BUILD THE CROWD"}</strong>
+        <div class="gig-progress"><i><b style="width:${Math.min(100, gig.recruitedFans / gig.targetFans * 100)}%"></b></i><span>${gig.recruitedFans}/${gig.targetFans} people</span></div>
+        <small>${gig.flyersRemaining} flyers left · return to Mossy Pocket Park</small>
+      `;
+      return;
+    }
+    if (gig.phase === "performing") {
+      this.gigStatus.innerHTML = `
+        <div class="gig-kicker live">● LIVE · MOSSY POCKET PARK</div>
+        <strong>SPACE ON THE GOLD BEAT</strong>
+        <small>←/→ crowd · Shift: Flourish · E: unlocked move</small>
+      `;
+      return;
+    }
+    const result = gig.lastResult;
+    this.gigStatus.innerHTML = result
+      ? `<div class="gig-kicker">FIRST SHOW</div><strong>${result.rating.toUpperCase()} · ${result.score}</strong><small>${gig.lifetimeFans} fans · $${result.tips} tips</small>`
+      : "";
   }
 
   private showIntro(): void {
     this.showMenu(
-      "Day 1",
-      "You have one tiny apartment, twenty dollars, and an unreasonable belief that Seattle might work out.",
+      "Tonight: your first show",
+      "You have no band, no reputation, and ten blank inches of sidewalk ambition. Mossy Pocket Park will let you play at 8 PM. Spend the day building a crowd, then prove they were right to come.",
       [
         {
-          label: "Find coffee. Find work. Make it home.",
+          label: "Book the street gig · Get 10 flyers",
           kind: "primary",
           action: () => {
-            this.closeMenu();
-            this.showToast(
-              "New opportunities: Find coffee · Find work. Hold Shift to run.",
-              5200,
-            );
+            this.handleResult(this.state.bookStreetGig());
           },
         },
       ],
-      "Welcome to Seattle",
+      "A rainy day · One shot at a crowd",
     );
   }
 
@@ -242,7 +314,55 @@ export class GameUI {
     if (locationId === "job-board") return this.openJobBoard();
     if (locationId === "workplace") return this.openWorkplace();
     if (locationId === "apartment") return this.openApartment();
+    if (locationId === "park") return this.openPark();
     return this.openDataLocation(locationId);
+  }
+
+  private openPark(): void {
+    this.state.visitLocation("park");
+    const snapshot = this.state.snapshot();
+    const choices: MenuChoice[] = [];
+    if (snapshot.gig.phase === "unbooked") {
+      choices.push({
+        label: "Book a street gig for 8 PM · Get 10 flyers",
+        kind: "primary",
+        action: () => this.handleResult(this.state.bookStreetGig()),
+      });
+    }
+    if (snapshot.gig.phase === "promoting") {
+      choices.push({
+        label: `Set up and play · ${snapshot.gig.recruitedFans} expected`,
+        kind: "primary",
+        reason:
+          snapshot.gig.recruitedFans >= snapshot.gig.targetFans
+            ? "You built the target crowd. Now earn them."
+            : `The target is ${snapshot.gig.targetFans}, but you can risk the show now.`,
+        action: () => {
+          const result = this.state.startStreetGig();
+          if (!result.ok) {
+            this.handleResult(result);
+            return;
+          }
+          this.closeMenu();
+          this.showToast(result.message, 1500);
+          this.scene?.beginStreetGig();
+        },
+      });
+    }
+    choices.push(this.interactionChoice("park-walk"));
+    choices.push({
+      label: "Back to the street",
+      kind: "secondary",
+      action: () => this.closeMenu(),
+    });
+    this.showMenu(
+      "Mossy Pocket Park",
+      snapshot.gig.phase === "promoting"
+        ? "The open guitar case marks the spot. When you are ready, the clock will move to showtime and every flyer promise will be tested."
+        : "Evergreens, wet benches, a nearby outlet, and enough foot traffic to imagine an audience.",
+      choices,
+      snapshot.gig.phase === "promoting" ? "Tonight's venue" : "Possible venue",
+    );
   }
 
   private openStreetEncounter(actorId: string, encounterId: string): void {

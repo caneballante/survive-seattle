@@ -8,10 +8,17 @@ import {
   STREET_ENCOUNTER_BY_ID,
 } from "./streetEncounters";
 import { getDailyWeather } from "./weather";
+import {
+  createFreshGig,
+  missedStreetGig,
+  scoreStreetGig,
+  STREET_GIG_FLYERS,
+} from "./gig";
 import type {
   ActionResult,
   CityEventDefinition,
   GameSnapshot,
+  GigPerformanceMetrics,
   HousingId,
   InteractionAvailability,
   InteractionDefinition,
@@ -85,6 +92,7 @@ export class GameState {
       currentDistrict: "Arrival Block",
       relationshipStrength: 0,
       familyMembers: 0,
+      gig: createFreshGig(),
     };
   }
 
@@ -103,6 +111,14 @@ export class GameState {
       unlockedRegions: [...this.data.unlockedRegions],
       activeEvents: [...this.data.activeEvents],
       eventCooldowns: { ...this.data.eventCooldowns },
+      gig: {
+        ...this.data.gig,
+        approachedPeople: [...this.data.gig.approachedPeople],
+        recruitedPeople: [...this.data.gig.recruitedPeople],
+        lastResult: this.data.gig.lastResult
+          ? { ...this.data.gig.lastResult }
+          : null,
+      },
     };
   }
 
@@ -153,6 +169,87 @@ export class GameState {
     this.data.energy = Math.max(0, this.data.energy - amount);
     this.emit();
     return true;
+  }
+
+  bookStreetGig(): ActionResult {
+    if (this.data.gig.phase !== "unbooked") {
+      return this.failure("Tonight's street gig is already on the calendar.");
+    }
+    this.data.gig.phase = "promoting";
+    this.data.gig.showDay = this.data.totalDays;
+    this.data.gig.flyersRemaining = STREET_GIG_FLYERS;
+    this.data.gig.recruitedFans = 0;
+    this.data.gig.approachedPeople = [];
+    this.data.gig.recruitedPeople = [];
+    this.data.gig.lastResult = null;
+    return this.finish(
+      "Mossy Pocket Park · 8:00 PM. You have ten flyers and one day to turn an empty sidewalk into a crowd.",
+    );
+  }
+
+  offerFlyer(personId: string, accepted: boolean): ActionResult {
+    if (this.data.gig.phase !== "promoting") {
+      return this.failure("There is no show to promote right now.");
+    }
+    if (this.data.gig.flyersRemaining <= 0) {
+      return this.failure("The last flyer is already somewhere in Seattle.");
+    }
+    if (this.data.gig.approachedPeople.includes(personId)) {
+      return this.failure("You already made the pitch to this person.");
+    }
+
+    this.data.gig.flyersRemaining -= 1;
+    this.data.gig.approachedPeople.push(personId);
+    if (accepted) {
+      this.data.gig.recruitedFans += 1;
+      this.data.gig.recruitedPeople.push(personId);
+    }
+    return this.finish(
+      accepted
+        ? "They take the flyer. One more person might actually show up."
+        : "A polite refusal. The flyer survives for someone else only in spirit.",
+    );
+  }
+
+  startStreetGig(): ActionResult {
+    if (this.data.gig.phase !== "promoting") {
+      return this.failure("The street gig is not ready to begin.");
+    }
+    if (this.data.gig.showDay !== this.data.totalDays) {
+      return this.failure("The show date has already passed.");
+    }
+    this.data.minutes = Math.max(this.data.minutes, this.data.gig.showTime);
+    this.data.gig.phase = "performing";
+    return this.finish(
+      `${this.data.gig.recruitedFans} promised attendee${this.data.gig.recruitedFans === 1 ? "" : "s"}. The case is open. The first beat is yours.`,
+    );
+  }
+
+  completeStreetGig(metrics: GigPerformanceMetrics): ActionResult {
+    if (this.data.gig.phase !== "performing") {
+      return this.failure("There is no live set to finish.");
+    }
+    const result = scoreStreetGig(
+      this.data.gig.recruitedFans,
+      this.data.gig.targetFans,
+      metrics,
+    );
+    this.data.gig.phase = "complete";
+    this.data.gig.lastResult = result;
+    this.data.gig.lifetimeFans += result.fansGained;
+    this.data.gig.showsPlayed += 1;
+    this.data.stats.money += result.tips;
+    this.data.stats.socialStatus = Math.max(
+      0,
+      this.data.stats.socialStatus + result.socialStatusChange,
+    );
+    this.data.stats.happiness = Math.max(
+      0,
+      this.data.stats.happiness + result.happinessChange,
+    );
+    this.data.energy = Math.max(0, this.data.energy - 10);
+    this.data.minutes += 45;
+    return this.finish(result.summary);
   }
 
   isRegionUnlocked(regionId: RegionId): boolean {
@@ -511,6 +608,25 @@ export class GameState {
   }
 
   sleep(): ActionResult {
+    let missedGigText = "";
+    if (
+      (this.data.gig.phase === "promoting" ||
+        this.data.gig.phase === "performing") &&
+      this.data.gig.showDay === this.data.totalDays
+    ) {
+      const result = missedStreetGig();
+      this.data.gig.phase = "complete";
+      this.data.gig.lastResult = result;
+      this.data.stats.socialStatus = Math.max(
+        0,
+        this.data.stats.socialStatus + result.socialStatusChange,
+      );
+      this.data.stats.happiness = Math.max(
+        0,
+        this.data.stats.happiness + result.happinessChange,
+      );
+      missedGigText = ` ${result.summary}`;
+    }
     this.data.stats.happiness += 1;
     const completedDay = this.data.day;
     const earned = this.data.daily.workCompleted ? "$100" : "$0";
@@ -555,7 +671,7 @@ export class GameState {
       ? " Overnight, several storefronts that were already visible begin offering slightly more plausible possibilities."
       : "";
     return this.finish(
-      `Day ${completedDay}: earned ${earned}, survived ${coffee}, and made it home. Happiness +1.${recurringText}${expansionText}`,
+      `Day ${completedDay}: earned ${earned}, survived ${coffee}, and made it home. Happiness +1.${recurringText}${expansionText}${missedGigText}`,
       undefined,
       {
         worldExpanded: firstExpansion,

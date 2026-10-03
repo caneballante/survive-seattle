@@ -1,10 +1,13 @@
-import type { GameSnapshot, LocationId, Opportunity } from "./types";
+import type { GameSnapshot, GigResult, LocationId, Opportunity } from "./types";
 import type { TargetDirection } from "./direction";
 
 export interface GameEventMap {
   focus: { locationId: LocationId | null; label: string };
   interact: { locationId: LocationId };
   streetEncounter: { actorId: string; encounterId: string };
+  flyerResult: { accepted: boolean; message: string };
+  crowdChanged: { label: string; target: number; active: number };
+  gigComplete: { result: GigResult };
   cue: {
     opportunity: Opportunity | null;
     direction: TargetDirection | null;

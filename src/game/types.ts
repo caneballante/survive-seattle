@@ -24,6 +24,46 @@ export type HousingId = "tiny-apartment" | "better-apartment" | "house";
 export type WeatherMode = "rain" | "cloudy" | "clear" | "snow" | "smoke";
 export type LocationRarity = 1 | 2 | 3 | 4 | 5;
 export type CarriedItem = "coffee" | null;
+export type GigPhase = "unbooked" | "promoting" | "performing" | "complete";
+
+export interface GigResult {
+  score: number;
+  rating: "No-show" | "Rough" | "Scrappy" | "Electric" | "Unforgettable";
+  attendance: number;
+  tips: number;
+  fansGained: number;
+  socialStatusChange: number;
+  happinessChange: number;
+  summary: string;
+  breakdown: string;
+}
+
+export interface GigProgress {
+  phase: GigPhase;
+  showDay: number | null;
+  showTime: number;
+  flyersRemaining: number;
+  targetFans: number;
+  recruitedFans: number;
+  approachedPeople: string[];
+  recruitedPeople: string[];
+  lifetimeFans: number;
+  showsPlayed: number;
+  lastResult: GigResult | null;
+}
+
+export interface GigPerformanceMetrics {
+  perfect: number;
+  good: number;
+  missed: number;
+  peakGroove: number;
+  leftCrowd: number;
+  rightCrowd: number;
+  walkIns: number;
+  walkouts: number;
+  specialMoves: number;
+  bestStreak: number;
+}
 
 export interface LocationDefinition {
   id: LocationId;
@@ -86,6 +126,7 @@ export interface GameSnapshot {
   currentDistrict: string;
   relationshipStrength: number;
   familyMembers: number;
+  gig: GigProgress;
 }
 
 export type OpportunityStatus = "inactive" | "active" | "completed";

@@ -8,6 +8,7 @@ import {
 } from "./atmosphere";
 import { getTargetDirection } from "./direction";
 import { GameEvents } from "./events";
+import { STREET_GIG_BEATS, STREET_GIG_BPM } from "./gig";
 import {
   GAME_HEIGHT,
   GAME_WIDTH,
@@ -32,7 +33,11 @@ import {
   STREET_ENCOUNTERS,
   type StreetEncounterDefinition,
 } from "./streetEncounters";
-import type { GameSnapshot, LocationId } from "./types";
+import type {
+  GameSnapshot,
+  GigPerformanceMetrics,
+  LocationId,
+} from "./types";
 
 interface LocationVisual {
   container: Phaser.GameObjects.Container;
@@ -66,17 +71,78 @@ interface StreetActorVisual {
   engaging: boolean;
 }
 
+interface FlyerProspectVisual {
+  id: string;
+  container: Phaser.GameObjects.Container;
+  figure: Phaser.GameObjects.Container;
+  leftLeg: Phaser.GameObjects.Rectangle;
+  rightLeg: Phaser.GameObjects.Rectangle;
+  reaction: Phaser.GameObjects.Text;
+  musicBadge: Phaser.GameObjects.Container;
+  direction: -1 | 1;
+  speed: number;
+  phase: number;
+  acceptsFlyer: boolean;
+}
+
+interface StreetGigVenueVisual {
+  container: Phaser.GameObjects.Container;
+  lights: Phaser.GameObjects.Arc[];
+  caseCoins: Phaser.GameObjects.Arc[];
+}
+
+interface StreetGigSession {
+  startedAt: number;
+  beatMs: number;
+  totalBeats: number;
+  lastBeat: number;
+  judgedAccents: Set<number>;
+  groove: number;
+  peakGroove: number;
+  leftCrowd: number;
+  rightCrowd: number;
+  side: -1 | 1;
+  perfect: number;
+  good: number;
+  missed: number;
+  streak: number;
+  bestStreak: number;
+  walkouts: number;
+  specialMoves: number;
+  tipCoins: number;
+  powerChordUnlocked: boolean;
+  powerChordUsed: boolean;
+  walkInIds: Set<string>;
+  walkedOutIds: Set<string>;
+  accentResults: Map<number, "perfect" | "good" | "missed">;
+  hud: Phaser.GameObjects.Container;
+  grooveFill: Phaser.GameObjects.Rectangle;
+  leftFill: Phaser.GameObjects.Rectangle;
+  rightFill: Phaser.GameObjects.Rectangle;
+  beatRing: Phaser.GameObjects.Arc;
+  beatTarget: Phaser.GameObjects.Arc;
+  beatCountdown: Phaser.GameObjects.Text;
+  accentPips: Phaser.GameObjects.Rectangle[];
+  scoreText: Phaser.GameObjects.Text;
+  moveText: Phaser.GameObjects.Text;
+  judgement: Phaser.GameObjects.Text;
+}
+
 const SIDEWALK_LANES = [STREET_Y - 34, STREET_Y + 2] as const;
 const PLAYER_GROUND_Y = SIDEWALK_LANES[1];
 const PLAYER_WALK_TEXTURE = "player-walk";
 const PLAYER_WALK_ANIMATION = "player-walk-animation";
 const PLAYER_BASELINE_OFFSET = 5;
 const STREET_CROWD_ENABLED = false;
+const FLYER_INTERACTION_DISTANCE = 72;
+const STREET_GIG_X = 920;
 
 export class SeattleScene extends Phaser.Scene {
   private player!: Phaser.GameObjects.Container;
   private playerSprite!: Phaser.GameObjects.Sprite;
   private carriedCoffee!: Phaser.GameObjects.Container;
+  private carriedFlyers!: Phaser.GameObjects.Container;
+  private performanceGuitar!: Phaser.GameObjects.Container;
   private skyBands: Phaser.GameObjects.Rectangle[] = [];
   private horizonGlow!: Phaser.GameObjects.Ellipse;
   private sun!: Phaser.GameObjects.Arc;
@@ -116,6 +182,11 @@ export class SeattleScene extends Phaser.Scene {
   private ambientTimeAccumulator = 0;
   private travelTimeAccumulator = 0;
   private streetActors: StreetActorVisual[] = [];
+  private flyerProspects: FlyerProspectVisual[] = [];
+  private focusedProspect: FlyerProspectVisual | null = null;
+  private focusKey = "";
+  private gigVenue!: StreetGigVenueVisual;
+  private gigSession: StreetGigSession | null = null;
   private crowdDay = -1;
   private lastCueKey = "";
   private renderedWorldStage = -1;
@@ -165,6 +236,8 @@ export class SeattleScene extends Phaser.Scene {
     this.createExpansionBarriers();
     this.createStreetLights();
     this.createPlayer();
+    this.createStreetGigVenue();
+    this.createFlyerCrowd();
     if (STREET_CROWD_ENABLED) this.createStreetCrowd();
     this.createRain();
     this.createLighting();
@@ -188,11 +261,17 @@ export class SeattleScene extends Phaser.Scene {
     keyboard.on("keydown-A", (event: KeyboardEvent) => tapMove(-1, event));
     keyboard.on("keydown-RIGHT", (event: KeyboardEvent) => tapMove(1, event));
     keyboard.on("keydown-D", (event: KeyboardEvent) => tapMove(1, event));
-    const tapInteract = (event: KeyboardEvent): void => {
+    keyboard.on("keydown-E", (event: KeyboardEvent) => {
+      if (event.repeat) return;
+      if (this.gigSession) this.triggerPowerChord();
+      else this.triggerInteraction();
+    });
+    keyboard.on("keydown-SPACE", (event: KeyboardEvent) => {
       if (!event.repeat) this.triggerInteraction();
-    };
-    keyboard.on("keydown-E", tapInteract);
-    keyboard.on("keydown-SPACE", tapInteract);
+    });
+    keyboard.on("keydown-SHIFT", (event: KeyboardEvent) => {
+      if (!event.repeat && this.gigSession) this.triggerFlourish();
+    });
 
     this.cameras.main.startFollow(this.player, true, 0.08, 0.08, 0, 40);
     this.unsubscribeState = this.gameState.subscribe((snapshot) => {
@@ -1006,13 +1085,268 @@ export class SeattleScene extends Phaser.Scene {
     this.carriedCoffee = this.add
       .container(0, PLAYER_BASELINE_OFFSET, [cupBody, cupLid, cupSleeve])
       .setVisible(this.snapshot.carriedItem === "coffee");
+    const flyerShadow = this.add.rectangle(22, -43, 18, 25, 0x1a2830, 0.42);
+    const flyerBack = this.add
+      .rectangle(20, -46, 18, 25, 0xded6ba)
+      .setStrokeStyle(1, 0x26363c)
+      .setAngle(-7);
+    const flyerFront = this.add
+      .rectangle(23, -49, 18, 25, 0xf4e8bd)
+      .setStrokeStyle(2, 0x26363c)
+      .setAngle(5);
+    const flyerInk = this.add.rectangle(23, -49, 10, 3, 0xc25145).setAngle(5);
+    this.carriedFlyers = this.add
+      .container(0, PLAYER_BASELINE_OFFSET, [flyerShadow, flyerBack, flyerFront, flyerInk])
+      .setVisible(false);
+
+    const guitarNeck = this.add
+      .rectangle(10, -67, 7, 53, 0xb77a43)
+      .setStrokeStyle(2, 0x2b2523)
+      .setAngle(-18);
+    const guitarBodyA = this.add
+      .circle(0, -39, 17, 0xd28a3e)
+      .setStrokeStyle(3, 0x372722);
+    const guitarBodyB = this.add
+      .circle(13, -34, 15, 0xc87538)
+      .setStrokeStyle(3, 0x372722);
+    const guitarHole = this.add.circle(7, -38, 5, 0x3a2925);
+    const guitarPickguard = this.add
+      .triangle(13, -38, -3, -4, 8, 2, 2, 13, 0x342a28, 0.82)
+      .setAngle(-16);
+    this.performanceGuitar = this.add
+      .container(0, PLAYER_BASELINE_OFFSET, [
+        guitarNeck,
+        guitarBodyA,
+        guitarBodyB,
+        guitarHole,
+        guitarPickguard,
+      ])
+      .setVisible(false);
     this.player = this.add
       .container(
         LOCATION_BY_ID.apartment.x + 10,
         PLAYER_GROUND_Y,
-        [shadow, this.playerSprite, this.carriedCoffee],
+        [
+          shadow,
+          this.playerSprite,
+          this.carriedCoffee,
+          this.carriedFlyers,
+          this.performanceGuitar,
+        ],
       )
       .setDepth(26);
+  }
+
+  private createStreetGigVenue(): void {
+    const children: Phaser.GameObjects.GameObject[] = [];
+    const rug = this.add
+      .rectangle(0, 4, 220, 25, 0x6d3d45, 0.92)
+      .setOrigin(0.5, 1)
+      .setStrokeStyle(3, 0x30272b);
+    const rugPattern = this.add.graphics();
+    rugPattern.lineStyle(2, 0xd0935c, 0.62);
+    for (let x = -92; x <= 92; x += 23) rugPattern.lineBetween(x, -17, x + 12, 1);
+
+    const amp = this.add
+      .rectangle(-76, -28, 52, 58, 0x202a2e)
+      .setOrigin(0.5, 1)
+      .setStrokeStyle(4, 0x10171b);
+    const ampCloth = this.add.rectangle(-76, -47, 39, 31, 0x4d5b58).setStrokeStyle(2, 0x151e22);
+    const ampKnobs = [-89, -80, -71, -62].map((x) => this.add.circle(x, -72, 2, 0xe3bd67));
+
+    const micStand = this.add.rectangle(60, -46, 4, 92, 0x29383d).setOrigin(0.5, 1);
+    const micArm = this.add.rectangle(48, -88, 31, 4, 0x29383d).setAngle(-8);
+    const mic = this.add.rectangle(32, -92, 13, 7, 0x111b20).setAngle(-8);
+
+    const caseBottom = this.add
+      .ellipse(88, 1, 74, 18, 0x231c1c)
+      .setOrigin(0.5, 1)
+      .setStrokeStyle(3, 0x8b5c3d);
+    const caseLining = this.add.ellipse(88, -5, 58, 10, 0x7f3737).setOrigin(0.5, 1);
+    const caseCoins = Array.from({ length: 14 }, (_, index) =>
+      this.add
+        .circle(65 + (index * 13) % 47, -7 - (index % 3) * 2, 3, 0xf0cc55)
+        .setStrokeStyle(1, 0x6b5221)
+        .setAlpha(0),
+    );
+
+    const leftPole = this.add.rectangle(-128, -78, 5, 156, 0x29393d).setOrigin(0.5, 1);
+    const rightPole = this.add.rectangle(128, -78, 5, 156, 0x29393d).setOrigin(0.5, 1);
+    const wire = this.add.graphics();
+    wire.lineStyle(2, 0x202b30, 0.95);
+    wire.beginPath();
+    wire.moveTo(-128, -153);
+    wire.lineTo(0, -133);
+    wire.lineTo(128, -153);
+    wire.strokePath();
+    const lights = Array.from({ length: 9 }, (_, index) => {
+      const x = -112 + index * 28;
+      const y = -148 + Math.abs(4 - index) * 4.5;
+      return this.add.circle(x, y, 5, index % 2 === 0 ? 0xffd66d : 0xf18b6d, 0.34);
+    });
+    const poster = this.add
+      .text(0, -178, "TONIGHT · 8 PM\nFIRST SHOW / FREE / PROBABLY LOUD", {
+        fontFamily: "Arial Black, Arial, sans-serif",
+        fontSize: "10px",
+        color: "#17252b",
+        backgroundColor: "#e6c664",
+        padding: { x: 9, y: 6 },
+        align: "center",
+        lineSpacing: 2,
+      })
+      .setOrigin(0.5)
+      .setAngle(-1);
+
+    children.push(
+      rug,
+      rugPattern,
+      amp,
+      ampCloth,
+      ...ampKnobs,
+      micStand,
+      micArm,
+      mic,
+      caseBottom,
+      caseLining,
+      ...caseCoins,
+      leftPole,
+      rightPole,
+      wire,
+      ...lights,
+      poster,
+    );
+    const container = this.add
+      .container(STREET_GIG_X, PLAYER_GROUND_Y, children)
+      .setDepth(19)
+      .setVisible(false);
+    this.gigVenue = { container, lights, caseCoins };
+
+    this.tweens.add({
+      targets: lights,
+      alpha: { from: 0.28, to: 0.9 },
+      duration: 820,
+      yoyo: true,
+      repeat: -1,
+      stagger: 85,
+      ease: "Sine.InOut",
+    });
+  }
+
+  private createFlyerCrowd(): void {
+    const positions = [
+      1080, 1280, 1490, 1730, 1960, 2210, 2740,
+      2960, 3190, 3430, 3680, 3940, 4200, 4440,
+    ];
+    const acceptance = [true, false, true, true, false, true, true, false, true, true, false, true, false, true];
+    this.flyerProspects = positions.map((x, index) =>
+      this.createFlyerProspect(index, x, acceptance[index]),
+    );
+  }
+
+  private createFlyerProspect(
+    index: number,
+    x: number,
+    acceptsFlyer: boolean,
+  ): FlyerProspectVisual {
+    const skins = [0x8a5d46, 0xc58d69, 0x684637, 0xd2a27f, 0x9d6a50];
+    const coats = [0x476a61, 0x9f5b49, 0x405f78, 0x77614d, 0x665477, 0xb18b3e];
+    const accents = [0xe1bd54, 0x72a9a3, 0xca725a, 0x8fbd73, 0xb68aba];
+    const skin = skins[index % skins.length];
+    const coat = coats[index % coats.length];
+    const accent = accents[index % accents.length];
+    const pants = index % 3 === 0 ? 0x26343d : index % 3 === 1 ? 0x403a3a : 0x283a36;
+    const direction = (index % 2 === 0 ? 1 : -1) as -1 | 1;
+
+    const shadow = this.add.ellipse(0, 3, 36, 9, 0x11191d, 0.25);
+    const leftLeg = this.add.rectangle(-7, -25, 8, 29, pants).setOrigin(0.5, 0).setStrokeStyle(1, 0x182329);
+    const rightLeg = this.add.rectangle(7, -25, 8, 29, pants).setOrigin(0.5, 0).setStrokeStyle(1, 0x182329);
+    const leftShoe = this.add.rectangle(-9, 2, 13, 5, 0x172126).setOrigin(0.5, 1);
+    const rightShoe = this.add.rectangle(9, 2, 13, 5, 0x172126).setOrigin(0.5, 1);
+    const torso = this.add
+      .rectangle(0, -50, 29 + (index % 2) * 3, 47, coat)
+      .setStrokeStyle(2, 0x17252b);
+    const jacketShade = this.add.rectangle(-9, -48, 7, 39, Phaser.Display.Color.ValueToColor(coat).darken(22).color, 0.7);
+    const zipper = this.add.rectangle(2, -50, 2, 37, accent, 0.7);
+    const arm = this.add.rectangle(16, -49, 9, 35, coat).setStrokeStyle(2, 0x17252b).setAngle(-10);
+    const hand = this.add.circle(19, -32, 5, skin).setStrokeStyle(1, 0x3b2a25);
+    const head = this.add.circle(1, -83, 14, skin).setStrokeStyle(2, 0x17252b);
+    const nose = this.add.rectangle(15, -82, 5, 4, skin).setStrokeStyle(1, 0x3b2a25);
+    const hair = this.add.arc(0, -88, 16, 184, 358, false, index % 4 === 0 ? 0x241f1e : 0x44342d).setStrokeStyle(2, 0x17252b);
+    const eye = this.add.rectangle(10, -86, 2, 2, 0x151a1d);
+    const figureChildren: Phaser.GameObjects.GameObject[] = [
+      shadow,
+      leftLeg,
+      rightLeg,
+      leftShoe,
+      rightShoe,
+      torso,
+      jacketShade,
+      zipper,
+      arm,
+      hand,
+      head,
+      nose,
+      hair,
+      eye,
+    ];
+
+    if (index % 4 === 0) {
+      figureChildren.push(
+        this.add.rectangle(0, -96, 27, 10, accent).setStrokeStyle(2, 0x17252b),
+        this.add.rectangle(-5, -104, 17, 8, accent).setStrokeStyle(2, 0x17252b),
+      );
+    } else if (index % 4 === 1) {
+      const tote = this.add.rectangle(-18, -39, 20, 27, accent).setStrokeStyle(2, 0x273138);
+      const strap = this.add.graphics();
+      strap.lineStyle(3, 0x273138, 1);
+      strap.arc(-9, -56, 15, Phaser.Math.DegToRad(100), Phaser.Math.DegToRad(245));
+      figureChildren.push(tote, strap);
+    } else if (index % 4 === 2) {
+      figureChildren.push(
+        this.add.arc(1, -84, 18, 105, 255, false, 0x202a31).setStrokeStyle(3, accent),
+        this.add.rectangle(18, -84, 5, 14, accent).setStrokeStyle(1, 0x17252b),
+      );
+    } else {
+      figureChildren.push(this.add.rectangle(0, -67, 31, 7, accent).setAngle(8));
+    }
+
+    const figure = this.add.container(0, 0, figureChildren).setScale(direction, 1);
+    const reaction = this.add
+      .text(0, -119, acceptsFlyer ? "♪ I'M IN" : "NO, THANKS", {
+        fontFamily: "Arial Black, Arial, sans-serif",
+        fontSize: "9px",
+        color: acceptsFlyer ? "#15302f" : "#442529",
+        backgroundColor: acceptsFlyer ? "#9de1c7" : "#f0b3a3",
+        padding: { x: 6, y: 4 },
+      })
+      .setOrigin(0.5)
+      .setVisible(false);
+    const badgeGlow = this.add.circle(0, -112, 15, 0xf3d469, 0.25);
+    const badgeDisc = this.add.circle(0, -112, 10, 0x18323a).setStrokeStyle(2, 0xf3d469);
+    const badgeNote = this.add.text(0, -113, "♪", {
+      fontFamily: "Georgia, serif",
+      fontSize: "16px",
+      color: "#ffe17a",
+    }).setOrigin(0.5);
+    const musicBadge = this.add.container(0, 0, [badgeGlow, badgeDisc, badgeNote]).setVisible(false);
+    const container = this.add
+      .container(x, PLAYER_GROUND_Y, [figure, reaction, musicBadge])
+      .setDepth(25)
+      .setVisible(false);
+
+    return {
+      id: `prospect-${index + 1}`,
+      container,
+      figure,
+      leftLeg,
+      rightLeg,
+      reaction,
+      musicBadge,
+      direction,
+      speed: 15 + (index % 5) * 3,
+      phase: index * 517,
+      acceptsFlyer,
+    };
   }
 
   private createStreetCrowd(): void {
@@ -1280,6 +1614,26 @@ export class SeattleScene extends Phaser.Scene {
     );
     this.rain?.setAlpha(this.snapshot.weather === "snow" ? 0.85 : 1);
     this.carriedCoffee?.setVisible(this.snapshot.carriedItem === "coffee");
+    this.carriedFlyers?.setVisible(
+      this.snapshot.gig.phase === "promoting" &&
+        this.snapshot.gig.flyersRemaining > 0,
+    );
+    this.performanceGuitar?.setVisible(this.snapshot.gig.phase === "performing");
+    this.gigVenue?.container.setVisible(this.snapshot.gig.phase !== "unbooked");
+    if (this.gigVenue && this.snapshot.gig.phase === "complete") {
+      const tips = this.snapshot.gig.lastResult?.tips ?? 0;
+      this.gigVenue.caseCoins.forEach((coin, index) =>
+        coin.setAlpha(index < Math.min(tips, this.gigVenue.caseCoins.length) ? 1 : 0),
+      );
+    }
+    const approached = new Set(this.snapshot.gig.approachedPeople);
+    const recruited = new Set(this.snapshot.gig.recruitedPeople);
+    this.flyerProspects.forEach((prospect) => {
+      prospect.musicBadge.setVisible(
+        recruited.has(prospect.id) && this.snapshot.gig.phase === "promoting",
+      );
+      if (!approached.has(prospect.id)) prospect.reaction.setVisible(false);
+    });
 
     const activeIds = new Set(this.gameState.opportunities.active().map((item) => item.id));
     this.opportunityMarkers.forEach((marker, id) => {
@@ -1455,11 +1809,273 @@ export class SeattleScene extends Phaser.Scene {
   }
 
   setTouchDirection(direction: number): void {
+    if (this.gigSession && direction !== 0) {
+      this.setShowSide(direction < 0 ? -1 : 1);
+      this.touchDirection = 0;
+      return;
+    }
     this.touchDirection = Phaser.Math.Clamp(direction, -1, 1);
   }
 
+  setTouchDepth(_direction: number): void {
+    // The legacy side-scrolling renderer intentionally has no depth axis.
+  }
+
   setTouchSprinting(sprinting: boolean): void {
+    if (this.gigSession) {
+      if (sprinting) {
+        if (this.gigSession.powerChordUnlocked && !this.gigSession.powerChordUsed) {
+          this.triggerPowerChord();
+        } else {
+          this.triggerFlourish();
+        }
+      }
+      this.touchSprinting = false;
+      return;
+    }
     this.touchSprinting = sprinting;
+  }
+
+  beginStreetGig(): void {
+    if (this.gigSession || this.snapshot.gig.phase !== "performing") return;
+    this.menuOpen = false;
+    this.touchDirection = 0;
+    this.touchSprinting = false;
+    this.player.x = STREET_GIG_X;
+    this.player.y = PLAYER_GROUND_Y;
+    this.player.scaleX = 1;
+    this.playerSprite.stop();
+    this.playerSprite.setFrame(0);
+    this.carriedCoffee.setVisible(false);
+    this.carriedFlyers.setVisible(false);
+    this.performanceGuitar.setVisible(true);
+    this.cameras.main.centerOn(STREET_GIG_X, GAME_HEIGHT / 2);
+    this.audio.beginPerformance();
+    this.gigVenue.caseCoins.forEach((coin) => coin.setAlpha(0));
+
+    const recruited = new Set(this.snapshot.gig.recruitedPeople);
+    const audienceOffsets = [-208, 198, -168, 160, -128, 122, -90, 88, -238, 230];
+    let audienceIndex = 0;
+    this.flyerProspects.forEach((prospect) => {
+      prospect.reaction.setVisible(false);
+      prospect.musicBadge.setVisible(false);
+      if (!recruited.has(prospect.id)) {
+        prospect.container.setVisible(false);
+        return;
+      }
+      const offset = audienceOffsets[audienceIndex] ?? (audienceIndex % 2 === 0 ? -260 : 260);
+      audienceIndex += 1;
+      prospect.container
+        .setVisible(true)
+        .setAlpha(1)
+        .setPosition(STREET_GIG_X + offset, PLAYER_GROUND_Y + 4 + (audienceIndex % 2) * 7)
+        .setDepth(27 + (audienceIndex % 2));
+      prospect.figure.setScale(offset < 0 ? 1 : -1, 1).setAlpha(1);
+    });
+
+    const panel = this.add
+      .rectangle(GAME_WIDTH / 2, 120, 660, 102, 0x081820, 0.94)
+      .setStrokeStyle(2, 0xd9c56d)
+      .setScrollFactor(0);
+    const title = this.add
+      .text(GAME_WIDTH / 2, 78, "WATCH THE RING · HIT SPACE WHEN IT CLOSES", {
+        fontFamily: "Arial Black, Arial, sans-serif",
+        fontSize: "12px",
+        color: "#f8e18a",
+        letterSpacing: 1,
+      })
+      .setOrigin(0.5)
+      .setScrollFactor(0);
+    const grooveBack = this.add.rectangle(GAME_WIDTH / 2 - 78, 101, 156, 10, 0x18323b).setOrigin(0, 0.5).setScrollFactor(0);
+    const grooveFill = this.add.rectangle(GAME_WIDTH / 2 - 78, 101, 1, 8, 0xf2c95c).setOrigin(0, 0.5).setScrollFactor(0);
+    const grooveLabel = this.add.text(GAME_WIDTH / 2, 113, "GROOVE", {
+      fontFamily: "Arial Black, Arial, sans-serif",
+      fontSize: "8px",
+      color: "#e7dba8",
+    }).setOrigin(0.5).setScrollFactor(0);
+    const leftBack = this.add.rectangle(GAME_WIDTH / 2 - 288, 101, 126, 10, 0x18323b).setOrigin(0, 0.5).setScrollFactor(0);
+    const leftFill = this.add.rectangle(GAME_WIDTH / 2 - 288, 101, 1, 8, 0x70b9ad).setOrigin(0, 0.5).setScrollFactor(0);
+    const leftLabel = this.add.text(GAME_WIDTH / 2 - 225, 113, "← LEFT CROWD", {
+      fontFamily: "Arial Black, Arial, sans-serif",
+      fontSize: "8px",
+      color: "#b9d8d2",
+    }).setOrigin(0.5).setScrollFactor(0);
+    const rightBack = this.add.rectangle(GAME_WIDTH / 2 + 162, 101, 126, 10, 0x18323b).setOrigin(0, 0.5).setScrollFactor(0);
+    const rightFill = this.add.rectangle(GAME_WIDTH / 2 + 162, 101, 1, 8, 0xe5846f).setOrigin(0, 0.5).setScrollFactor(0);
+    const rightLabel = this.add.text(GAME_WIDTH / 2 + 225, 113, "RIGHT CROWD →", {
+      fontFamily: "Arial Black, Arial, sans-serif",
+      fontSize: "8px",
+      color: "#e8b3a6",
+    }).setOrigin(0.5).setScrollFactor(0);
+    const accentPips = Array.from({ length: STREET_GIG_BEATS / 4 - 1 }, (_, index) =>
+      this.add
+        .rectangle(GAME_WIDTH / 2 - 100 + index * 20, 132, 13, 7, 0x24434a)
+        .setStrokeStyle(1, 0x56767a)
+        .setScrollFactor(0),
+    );
+    const scoreText = this.add.text(GAME_WIDTH / 2 - 300, 147, "0 PERFECT · 0 GOOD · 0 MISS · STREAK 0", {
+      fontFamily: "Arial Black, Arial, sans-serif",
+      fontSize: "8px",
+      color: "#d8e2d9",
+    }).setOrigin(0, 0.5).setScrollFactor(0);
+    const moveText = this.add.text(GAME_WIDTH / 2 + 300, 147, "SHIFT FLOURISH · 35 GROOVE  |  E POWER CHORD · 3 PERFECTS", {
+      fontFamily: "Arial Black, Arial, sans-serif",
+      fontSize: "8px",
+      color: "#8fa7a8",
+    }).setOrigin(1, 0.5).setScrollFactor(0);
+    const hud = this.add
+      .container(0, 0, [
+        panel,
+        title,
+        grooveBack,
+        grooveFill,
+        grooveLabel,
+        leftBack,
+        leftFill,
+        leftLabel,
+        rightBack,
+        rightFill,
+        rightLabel,
+        ...accentPips,
+        scoreText,
+        moveText,
+      ])
+      .setDepth(80);
+
+    const beatTarget = this.add
+      .circle(STREET_GIG_X, PLAYER_GROUND_Y - 57, 30, 0xf5d86a, 0.08)
+      .setStrokeStyle(3, 0xf5d86a, 0.7)
+      .setDepth(41);
+    const beatRing = this.add
+      .circle(STREET_GIG_X, PLAYER_GROUND_Y - 57, 30, 0xf5d86a, 0)
+      .setStrokeStyle(5, 0xf5d86a, 1)
+      .setDepth(42)
+      .setScale(2.5)
+      .setAlpha(0.18);
+    const beatCountdown = this.add
+      .text(STREET_GIG_X, PLAYER_GROUND_Y - 57, "3", {
+        fontFamily: "Arial Black, Arial, sans-serif",
+        fontSize: "19px",
+        color: "#f9e69a",
+      })
+      .setOrigin(0.5)
+      .setDepth(43);
+    const judgement = this.add
+      .text(STREET_GIG_X, PLAYER_GROUND_Y - 142, "GET READY", {
+        fontFamily: "Arial Black, Arial, sans-serif",
+        fontSize: "18px",
+        color: "#ffe077",
+        backgroundColor: "#132730",
+        padding: { x: 9, y: 5 },
+      })
+      .setOrigin(0.5)
+      .setDepth(44);
+
+    const openingEnergy = Math.min(66, 30 + this.snapshot.gig.recruitedFans * 5);
+    const openingGroove = Math.min(38, 12 + this.snapshot.gig.recruitedFans * 4);
+    this.gigSession = {
+      startedAt: this.time.now + 1400,
+      beatMs: 60000 / STREET_GIG_BPM,
+      totalBeats: STREET_GIG_BEATS,
+      lastBeat: -1,
+      judgedAccents: new Set(),
+      groove: openingGroove,
+      peakGroove: openingGroove,
+      leftCrowd: openingEnergy,
+      rightCrowd: openingEnergy,
+      side: 1,
+      perfect: 0,
+      good: 0,
+      missed: 0,
+      streak: 0,
+      bestStreak: 0,
+      walkouts: 0,
+      specialMoves: 0,
+      tipCoins: 0,
+      powerChordUnlocked: false,
+      powerChordUsed: false,
+      walkInIds: new Set(),
+      walkedOutIds: new Set(),
+      accentResults: new Map(),
+      hud,
+      grooveFill,
+      leftFill,
+      rightFill,
+      beatRing,
+      beatTarget,
+      beatCountdown,
+      accentPips,
+      scoreText,
+      moveText,
+      judgement,
+    };
+    this.updateShowMeters();
+    this.gameEvents.emit("focus", { locationId: null, label: "" });
+  }
+
+  triggerFlourish(): void {
+    const session = this.gigSession;
+    if (!session || session.groove < 35) {
+      if (session) this.showJudgement("NEED 35 GROOVE", "#d6aaa0");
+      return;
+    }
+    session.groove -= 35;
+    session.specialMoves += 1;
+    session.leftCrowd = Math.min(100, session.leftCrowd + 24);
+    session.rightCrowd = Math.min(100, session.rightCrowd + 24);
+    this.showJudgement("FLOURISH!", "#ffdf72");
+    this.audio.playPerformanceCue("flourish");
+    this.reactAudience(-1, "flourish");
+    this.reactAudience(1, "flourish");
+    this.dropTipCoin(session.side);
+    this.tweens.add({
+      targets: this.performanceGuitar,
+      angle: { from: -12, to: 13 },
+      scale: { from: 1.12, to: 1 },
+      duration: 260,
+      yoyo: true,
+      ease: "Back.Out",
+    });
+    this.emitMusicBurst(8, 0xf6cf61);
+    this.updateShowMeters();
+  }
+
+  triggerPowerChord(): void {
+    const session = this.gigSession;
+    if (!session) return;
+    if (!session.powerChordUnlocked) {
+      this.showJudgement(`${Math.max(0, 3 - session.perfect)} PERFECTS TO UNLOCK`, "#9bb2b2");
+      return;
+    }
+    if (session.powerChordUsed) {
+      this.showJudgement("POWER CHORD SPENT", "#9bb2b2");
+      return;
+    }
+
+    session.powerChordUsed = true;
+    session.specialMoves += 1;
+    session.groove = Math.min(100, session.groove + 18);
+    session.peakGroove = Math.max(session.peakGroove, session.groove);
+    session.leftCrowd = Math.min(100, session.leftCrowd + 28);
+    session.rightCrowd = Math.min(100, session.rightCrowd + 28);
+    this.showJudgement("POWER CHORD!", "#fff19a");
+    this.audio.playPerformanceCue("flourish");
+    this.reactAudience(-1, "flourish");
+    this.reactAudience(1, "flourish");
+    this.attractWalkIn();
+    this.dropTipCoin(-1);
+    this.time.delayedCall(120, () => this.dropTipCoin(1));
+    this.emitMusicBurst(14, 0xffe577);
+    this.cameras.main.shake(180, 0.004);
+    this.tweens.add({
+      targets: this.performanceGuitar,
+      angle: { from: -18, to: 18 },
+      scale: { from: 1.25, to: 1 },
+      duration: 360,
+      yoyo: true,
+      ease: "Back.Out",
+    });
+    this.updateShowMeters();
   }
 
   completeStreetEncounter(actorId: string): void {
@@ -1494,6 +2110,10 @@ export class SeattleScene extends Phaser.Scene {
 
   nudgePlayer(direction: number): void {
     if (this.menuOpen) return;
+    if (this.gigSession) {
+      this.setShowSide(direction < 0 ? -1 : 1);
+      return;
+    }
     const step = this.touchSprinting && this.snapshot.energy > 0 ? 22 : 14;
     this.player.x = Phaser.Math.Clamp(
       this.player.x + Phaser.Math.Clamp(direction, -1, 1) * step,
@@ -1503,10 +2123,553 @@ export class SeattleScene extends Phaser.Scene {
     this.playFootstep(this.time.now);
   }
 
+  nudgePlayerDepth(_direction: number): void {
+    // The legacy side-scrolling renderer intentionally has no depth axis.
+  }
+
   triggerInteraction(): void {
-    if (!this.menuOpen && this.focusedLocation) {
+    if (this.menuOpen) return;
+    if (this.gigSession) {
+      this.attemptShowHit();
+      return;
+    }
+    if (this.focusedProspect) {
+      this.offerFlyer(this.focusedProspect);
+      return;
+    }
+    if (this.focusedLocation) {
       this.gameEvents.emit("interact", { locationId: this.focusedLocation });
     }
+  }
+
+  private offerFlyer(prospect: FlyerProspectVisual): void {
+    const result = this.gameState.offerFlyer(prospect.id, prospect.acceptsFlyer);
+    if (!result.ok) {
+      this.gameEvents.emit("flyerResult", {
+        accepted: false,
+        message: result.message,
+      });
+      return;
+    }
+
+    const startX = this.player.x + (prospect.container.x < this.player.x ? -20 : 20);
+    const flyer = this.add
+      .rectangle(startX, PLAYER_GROUND_Y - 51, 18, 25, 0xf3e5b4)
+      .setStrokeStyle(2, 0x26363c)
+      .setDepth(46)
+      .setAngle(prospect.container.x < this.player.x ? -12 : 12);
+    const ink = this.add
+      .rectangle(startX, PLAYER_GROUND_Y - 54, 10, 3, 0xc55849)
+      .setDepth(47);
+    this.tweens.add({
+      targets: [flyer, ink],
+      x: prospect.container.x,
+      y: PLAYER_GROUND_Y - 49,
+      angle: 0,
+      duration: 300,
+      ease: "Quad.Out",
+      onComplete: () => {
+        flyer.destroy();
+        ink.destroy();
+        prospect.reaction.setVisible(true).setAlpha(1).setY(-119);
+        if (prospect.acceptsFlyer) {
+          prospect.musicBadge.setVisible(true).setScale(0.4);
+          this.tweens.add({
+            targets: prospect.musicBadge,
+            scale: 1,
+            duration: 420,
+            ease: "Back.Out",
+          });
+        }
+        this.tweens.add({
+          targets: prospect.reaction,
+          y: -130,
+          alpha: 0,
+          delay: 850,
+          duration: 520,
+          onComplete: () => prospect.reaction.setVisible(false),
+        });
+      },
+    });
+    this.gameEvents.emit("flyerResult", {
+      accepted: prospect.acceptsFlyer,
+      message: result.message,
+    });
+  }
+
+  private setShowSide(side: -1 | 1): void {
+    const session = this.gigSession;
+    if (!session) return;
+    session.side = side;
+    this.player.scaleX = side;
+    const targetX = STREET_GIG_X + side * 30;
+    this.tweens.add({
+      targets: this.player,
+      x: targetX,
+      duration: 150,
+      ease: "Sine.Out",
+    });
+    this.updateShowMeters();
+  }
+
+  private attemptShowHit(): void {
+    const session = this.gigSession;
+    if (!session) return;
+    const elapsed = this.time.now - session.startedAt;
+    if (elapsed < 0) return;
+    const accentSpan = session.beatMs * 4;
+    const nearestAccent = Phaser.Math.Clamp(
+      Math.round(elapsed / accentSpan) * 4,
+      4,
+      session.totalBeats - 4,
+    );
+    const distance = Math.abs(elapsed - nearestAccent * session.beatMs);
+    if (session.judgedAccents.has(nearestAccent)) {
+      this.showJudgement("HOLD...", "#a8c5c4");
+      return;
+    }
+    if (distance > 290) {
+      session.groove = Math.max(0, session.groove - 3);
+      session.streak = 0;
+      this.showJudgement(
+        elapsed < nearestAccent * session.beatMs ? "TOO EARLY · WATCH THE RING" : "TOO LATE",
+        "#e69a8d",
+      );
+      this.audio.playPerformanceCue("miss");
+      this.cameras.main.shake(70, 0.0015);
+      this.updateShowMeters();
+      return;
+    }
+
+    session.judgedAccents.add(nearestAccent);
+    const perfect = distance <= 135;
+    const gain = perfect ? 18 : 11;
+    session.groove = Math.min(100, session.groove + gain);
+    session.peakGroove = Math.max(session.peakGroove, session.groove);
+    session.streak += 1;
+    session.bestStreak = Math.max(session.bestStreak, session.streak);
+    if (session.side < 0) {
+      session.leftCrowd = Math.min(100, session.leftCrowd + (perfect ? 19 : 12));
+      session.rightCrowd = Math.max(0, session.rightCrowd - 2);
+    } else {
+      session.rightCrowd = Math.min(100, session.rightCrowd + (perfect ? 19 : 12));
+      session.leftCrowd = Math.max(0, session.leftCrowd - 2);
+    }
+    if (perfect) {
+      session.perfect += 1;
+      if (session.perfect >= 3 && !session.powerChordUnlocked) {
+        session.powerChordUnlocked = true;
+        this.time.delayedCall(420, () => this.showJudgement("POWER CHORD UNLOCKED · E", "#fff19a"));
+      }
+    } else {
+      session.good += 1;
+    }
+    this.setAccentResult(nearestAccent, perfect ? "perfect" : "good");
+    this.showJudgement(
+      perfect ? `PERFECT! · ${session.streak} STREAK` : `GOOD · ${session.streak} STREAK`,
+      perfect ? "#ffe36f" : "#91d9c8",
+    );
+    this.audio.playPerformanceCue(perfect ? "perfect" : "good");
+    this.reactAudience(session.side, perfect ? "perfect" : "good");
+    if (perfect) {
+      this.dropTipCoin(session.side);
+      this.cameras.main.shake(70, 0.0015);
+    }
+    if ([3, 6, 9].includes(session.streak)) this.attractWalkIn();
+    this.emitMusicBurst(perfect ? 6 : 3, perfect ? 0xf6d25f : 0x75c5b6);
+    this.tweens.add({
+      targets: this.performanceGuitar,
+      angle: session.side * (perfect ? 8 : 4),
+      duration: 90,
+      yoyo: true,
+      ease: "Quad.Out",
+    });
+    this.updateShowMeters();
+  }
+
+  private showJudgement(text: string, color: string): void {
+    const judgement = this.gigSession?.judgement;
+    if (!judgement) return;
+    judgement.setText(text).setColor(color).setAlpha(1).setScale(0.75).setY(PLAYER_GROUND_Y - 142);
+    this.tweens.killTweensOf(judgement);
+    this.tweens.add({
+      targets: judgement,
+      scale: 1,
+      y: PLAYER_GROUND_Y - 154,
+      duration: 220,
+      ease: "Back.Out",
+      onComplete: () => {
+        this.tweens.add({
+          targets: judgement,
+          alpha: 0,
+          delay: 340,
+          duration: 260,
+        });
+      },
+    });
+  }
+
+  private setAccentResult(accent: number, result: "perfect" | "good" | "missed"): void {
+    const session = this.gigSession;
+    if (!session) return;
+    session.accentResults.set(accent, result);
+    const pip = session.accentPips[accent / 4 - 1];
+    if (!pip) return;
+    const color = result === "perfect" ? 0xffdf65 : result === "good" ? 0x7bd0c0 : 0xd46f62;
+    pip.setFillStyle(color).setStrokeStyle(2, color).setAlpha(1).setScale(1.2);
+    this.tweens.add({ targets: pip, scale: 1, duration: 180, ease: "Back.Out" });
+  }
+
+  private liveAudience(): FlyerProspectVisual[] {
+    const session = this.gigSession;
+    if (!session) return [];
+    const recruited = new Set(this.snapshot.gig.recruitedPeople);
+    return this.flyerProspects.filter(
+      (prospect) =>
+        (recruited.has(prospect.id) || session.walkInIds.has(prospect.id)) &&
+        !session.walkedOutIds.has(prospect.id),
+    );
+  }
+
+  private reactAudience(side: -1 | 1, reaction: "good" | "perfect" | "flourish" | "miss"): void {
+    const text =
+      reaction === "flourish" ? "★!" : reaction === "perfect" ? "★" : reaction === "miss" ? "…" : "!";
+    const color = reaction === "miss" ? "#d69a8e" : reaction === "good" ? "#91d9c8" : "#ffe36f";
+    this.liveAudience()
+      .filter((prospect) => (prospect.container.x < STREET_GIG_X ? -1 : 1) === side)
+      .forEach((prospect, index) => {
+        this.tweens.killTweensOf(prospect.reaction);
+        prospect.reaction
+          .setText(text)
+          .setColor(color)
+          .setVisible(true)
+          .setAlpha(1)
+          .setY(-120 - (index % 2) * 6);
+        this.tweens.add({
+          targets: prospect.reaction,
+          y: prospect.reaction.y - 15,
+          alpha: 0,
+          duration: 620,
+          delay: index * 45,
+          ease: "Quad.Out",
+          onComplete: () => prospect.reaction.setVisible(false),
+        });
+        this.tweens.add({
+          targets: prospect.figure,
+          scaleY: reaction === "flourish" ? 1.16 : reaction === "miss" ? 0.94 : 1.1,
+          duration: 100,
+          yoyo: true,
+          ease: "Back.Out",
+        });
+      });
+  }
+
+  private attractWalkIn(): void {
+    const session = this.gigSession;
+    if (!session || session.walkInIds.size >= 3) return;
+    const recruited = new Set(this.snapshot.gig.recruitedPeople);
+    const prospect = this.flyerProspects.find(
+      (candidate) =>
+        !recruited.has(candidate.id) &&
+        !session.walkInIds.has(candidate.id) &&
+        !session.walkedOutIds.has(candidate.id),
+    );
+    if (!prospect) return;
+    const side: -1 | 1 = session.leftCrowd <= session.rightCrowd ? -1 : 1;
+    session.walkInIds.add(prospect.id);
+    const destinationX = STREET_GIG_X + side * (225 - session.walkInIds.size * 13);
+    prospect.container
+      .setVisible(true)
+      .setAlpha(0)
+      .setPosition(destinationX + side * 55, PLAYER_GROUND_Y + 10 + (session.walkInIds.size % 2) * 6)
+      .setDepth(27 + (session.walkInIds.size % 2));
+    prospect.figure.setScale(side < 0 ? 1 : -1, 1);
+    prospect.reaction.setText("♫").setColor("#ffe36f").setVisible(true).setAlpha(1);
+    this.tweens.add({
+      targets: prospect.container,
+      x: destinationX,
+      alpha: 1,
+      duration: 520,
+      ease: "Back.Out",
+    });
+    this.tweens.add({
+      targets: prospect.reaction,
+      y: -138,
+      alpha: 0,
+      duration: 800,
+      onComplete: () => prospect.reaction.setVisible(false),
+    });
+    this.time.delayedCall(180, () => this.showJudgement("A WALK-IN JOINS!", "#ffe36f"));
+    this.audio.play("notice");
+  }
+
+  private maybeWalkOut(side: -1 | 1): void {
+    const session = this.gigSession;
+    if (!session || session.lastBeat < 12) return;
+    const energy = side < 0 ? session.leftCrowd : session.rightCrowd;
+    if (energy > 8) return;
+    const recruited = new Set(this.snapshot.gig.recruitedPeople);
+    const prospect = this.liveAudience().find(
+      (candidate) =>
+        recruited.has(candidate.id) &&
+        (candidate.container.x < STREET_GIG_X ? -1 : 1) === side,
+    );
+    if (!prospect) return;
+
+    session.walkedOutIds.add(prospect.id);
+    session.walkouts += 1;
+    session.streak = 0;
+    if (side < 0) session.leftCrowd = 16;
+    else session.rightCrowd = 16;
+    prospect.reaction.setText("NOPE").setColor("#ef9b8d").setVisible(true).setAlpha(1);
+    this.tweens.add({
+      targets: prospect.container,
+      x: prospect.container.x + side * 170,
+      alpha: 0,
+      duration: 900,
+      ease: "Quad.In",
+      onComplete: () => prospect.container.setVisible(false),
+    });
+    this.showJudgement(`${side < 0 ? "LEFT" : "RIGHT"} SIDE LOST SOMEONE`, "#ef9b8d");
+    this.audio.playPerformanceCue("miss");
+  }
+
+  private dropTipCoin(side: -1 | 1): void {
+    const session = this.gigSession;
+    if (!session || session.tipCoins >= this.gigVenue.caseCoins.length) return;
+    const target = this.gigVenue.caseCoins[session.tipCoins];
+    session.tipCoins += 1;
+    const coin = this.add
+      .circle(STREET_GIG_X + side * 155, PLAYER_GROUND_Y - 82, 5, 0xf4d260)
+      .setStrokeStyle(2, 0x684d20)
+      .setDepth(48);
+    this.tweens.add({
+      targets: coin,
+      x: STREET_GIG_X + target.x,
+      y: PLAYER_GROUND_Y + target.y,
+      angle: side * 540,
+      duration: 520,
+      ease: "Bounce.In",
+      onComplete: () => {
+        target.setAlpha(1);
+        coin.destroy();
+        this.audio.playPerformanceCue("coin");
+      },
+    });
+  }
+
+  private emitMusicBurst(count: number, color: number): void {
+    for (let index = 0; index < count; index += 1) {
+      const side = index % 2 === 0 ? -1 : 1;
+      const note = this.add
+        .text(STREET_GIG_X + side * (10 + index * 4), PLAYER_GROUND_Y - 76, index % 3 === 0 ? "♫" : "♪", {
+          fontFamily: "Georgia, serif",
+          fontSize: `${15 + (index % 3) * 3}px`,
+          color: `#${color.toString(16).padStart(6, "0")}`,
+        })
+        .setOrigin(0.5)
+        .setDepth(43);
+      this.tweens.add({
+        targets: note,
+        x: note.x + side * (46 + index * 10),
+        y: note.y - 48 - (index % 3) * 14,
+        alpha: 0,
+        angle: side * 18,
+        duration: 720 + index * 45,
+        ease: "Quad.Out",
+        onComplete: () => note.destroy(),
+      });
+    }
+  }
+
+  private updateShowMeters(): void {
+    const session = this.gigSession;
+    if (!session) return;
+    session.grooveFill.displayWidth = Math.max(1, 156 * session.groove / 100);
+    session.leftFill.displayWidth = Math.max(1, 126 * session.leftCrowd / 100);
+    session.rightFill.displayWidth = Math.max(1, 126 * session.rightCrowd / 100);
+    session.leftFill.setFillStyle(
+      session.leftCrowd < 20 ? 0xd96e61 : session.side < 0 ? 0xa7eadc : 0x548e89,
+    );
+    session.rightFill.setFillStyle(
+      session.rightCrowd < 20 ? 0xd96e61 : session.side > 0 ? 0xffa18d : 0xa0584c,
+    );
+    session.scoreText.setText(
+      `${session.perfect} PERFECT · ${session.good} GOOD · ${session.missed} MISS · STREAK ${session.streak}`,
+    );
+    if (session.powerChordUnlocked && !session.powerChordUsed) {
+      session.moveText.setText("E POWER CHORD READY!  |  SHIFT FLOURISH · 35").setColor("#ffe36f");
+    } else if (session.groove >= 35) {
+      session.moveText
+        .setText(`SHIFT FLOURISH READY!  |  ${session.powerChordUsed ? "POWER CHORD SPENT" : "E POWER CHORD · 3 PERFECTS"}`)
+        .setColor("#91d9c8");
+    } else {
+      session.moveText
+        .setText(
+          `SHIFT FLOURISH · ${Math.ceil(Math.max(0, 35 - session.groove))} MORE GROOVE  |  ${session.powerChordUsed ? "POWER CHORD SPENT" : "E POWER CHORD · 3 PERFECTS"}`,
+        )
+        .setColor("#8fa7a8");
+    }
+  }
+
+  private pulseShowBeat(accent: boolean, beat: number): void {
+    const session = this.gigSession;
+    if (!session) return;
+    session.beatTarget
+      .setStrokeStyle(accent ? 6 : 3, accent ? 0xffda62 : 0x79b8b0, accent ? 1 : 0.58)
+      .setScale(accent ? 0.82 : 0.94)
+      .setAlpha(1);
+    this.tweens.killTweensOf(session.beatTarget);
+    this.tweens.add({
+      targets: session.beatTarget,
+      scale: 1,
+      alpha: accent ? 0.72 : 0.38,
+      duration: accent ? 220 : 160,
+      ease: "Back.Out",
+    });
+    session.beatCountdown
+      .setText(accent ? "HIT!" : beat === 0 ? "READY" : String(4 - (beat % 4)))
+      .setColor(accent ? "#ffe36f" : "#b7d6d1")
+      .setScale(accent ? 1.3 : 0.9)
+      .setAlpha(1);
+    this.tweens.add({
+      targets: session.beatCountdown,
+      scale: 1,
+      duration: 150,
+      ease: "Back.Out",
+    });
+    if (accent) {
+      const pip = session.accentPips[beat / 4 - 1];
+      pip?.setStrokeStyle(2, 0xffdf65).setScale(1.25);
+      if (pip) this.tweens.add({ targets: pip, scale: 1, duration: 220, ease: "Back.Out" });
+    }
+    this.audio.playPerformanceCue(accent ? "accent" : "beat");
+    this.gigVenue.lights.forEach((light, index) => {
+      light.setAlpha(accent && index % 2 === 0 ? 1 : 0.58);
+    });
+  }
+
+  private updateBeatCue(elapsed: number): void {
+    const session = this.gigSession;
+    if (!session || elapsed < 0) return;
+    const beatPosition = elapsed / session.beatMs;
+    const cycle = beatPosition % 4;
+    const distanceFromAccent = Math.min(cycle, 4 - cycle);
+    const finalBeatApproach = cycle >= 3;
+    if (finalBeatApproach) {
+      const remaining = 4 - cycle;
+      session.beatRing
+        .setScale(1 + remaining * 1.6)
+        .setAlpha(0.35 + (1 - remaining) * 0.65)
+        .setStrokeStyle(5, 0xffdf65, 1);
+    } else if (distanceFromAccent < 0.2) {
+      session.beatRing.setScale(1).setAlpha(0.95).setStrokeStyle(6, 0xffdf65, 1);
+    } else {
+      session.beatRing.setScale(2.5).setAlpha(0.12).setStrokeStyle(3, 0x79b8b0, 0.55);
+    }
+  }
+
+  private updateStreetGig(time: number): void {
+    const session = this.gigSession;
+    if (!session) return;
+    const elapsed = time - session.startedAt;
+    if (elapsed < 0) {
+      const count = Math.max(1, Math.ceil(-elapsed / 470));
+      session.beatCountdown.setText(String(count)).setColor("#ffe36f");
+      return;
+    }
+    this.updateBeatCue(elapsed);
+    const beat = Math.floor(elapsed / session.beatMs);
+    if (beat > session.lastBeat) {
+      for (let nextBeat = session.lastBeat + 1; nextBeat <= beat; nextBeat += 1) {
+        if (nextBeat < 0) continue;
+        const accent = nextBeat > 0 && nextBeat % 4 === 0;
+        this.pulseShowBeat(accent, nextBeat);
+        session.leftCrowd = Math.max(0, session.leftCrowd - (accent ? 2.4 : 0.6));
+        session.rightCrowd = Math.max(0, session.rightCrowd - (accent ? 2.4 : 0.6));
+        if (
+          accent &&
+          nextBeat <= session.totalBeats - 4 &&
+          !session.judgedAccents.has(nextBeat - 4) &&
+          nextBeat - 4 >= 4
+        ) {
+          session.judgedAccents.add(nextBeat - 4);
+          session.missed += 1;
+          session.streak = 0;
+          session.groove = Math.max(0, session.groove - 12);
+          this.setAccentResult(nextBeat - 4, "missed");
+          this.showJudgement("MISSED · CROWD IS COOLING", "#d9897a");
+          this.audio.playPerformanceCue("miss");
+          this.reactAudience(session.side, "miss");
+        }
+        if (accent) {
+          this.maybeWalkOut(-1);
+          this.maybeWalkOut(1);
+        }
+      }
+      session.lastBeat = beat;
+      this.updateShowMeters();
+    }
+
+    this.liveAudience().forEach((prospect, index) => {
+      const onLeft = prospect.container.x < STREET_GIG_X;
+      const energy = onLeft ? session.leftCrowd : session.rightCrowd;
+      const bounce = Math.sin(time / Math.max(95, 240 - energy) + index) * (2 + energy / 24);
+      prospect.figure.y = Math.min(0, bounce);
+      prospect.figure.setAlpha(0.58 + energy / 240);
+      prospect.leftLeg.setAngle(Math.sin(time / 150 + index) * (energy / 12));
+      prospect.rightLeg.setAngle(-prospect.leftLeg.angle);
+    });
+
+    if (elapsed >= session.totalBeats * session.beatMs) this.finishStreetGig();
+  }
+
+  private finishStreetGig(): void {
+    const session = this.gigSession;
+    if (!session) return;
+    const finalAccent = session.totalBeats - 4;
+    if (!session.judgedAccents.has(finalAccent)) {
+      session.missed += 1;
+      this.setAccentResult(finalAccent, "missed");
+    }
+    const metrics: GigPerformanceMetrics = {
+      perfect: session.perfect,
+      good: session.good,
+      missed: session.missed,
+      peakGroove: session.peakGroove,
+      leftCrowd: session.leftCrowd,
+      rightCrowd: session.rightCrowd,
+      walkIns: session.walkInIds.size,
+      walkouts: session.walkouts,
+      specialMoves: session.specialMoves,
+      bestStreak: session.bestStreak,
+    };
+    session.hud.destroy(true);
+    session.beatRing.destroy();
+    session.beatTarget.destroy();
+    session.beatCountdown.destroy();
+    session.judgement.destroy();
+    this.flyerProspects.forEach((prospect) => prospect.figure.setAlpha(1));
+    this.gigSession = null;
+    this.audio.endPerformance();
+    const result = this.gameState.completeStreetGig(metrics);
+    const gigResult = this.gameState.snapshot().gig.lastResult;
+    if (!result.ok || !gigResult) return;
+    this.performanceGuitar.setVisible(false);
+    this.gigVenue.caseCoins.forEach((coin, index) => {
+      if (index >= Math.min(gigResult.tips, this.gigVenue.caseCoins.length)) return;
+      coin.setAlpha(0).setY(coin.y - 25);
+      this.tweens.add({
+        targets: coin,
+        alpha: 1,
+        y: coin.y + 25,
+        duration: 360,
+        delay: index * 75,
+        ease: "Bounce.Out",
+      });
+    });
+    this.emitMusicBurst(10, gigResult.score >= 55 ? 0xf6d25f : 0x8a9ca0);
+    this.gameEvents.emit("gigComplete", { result: gigResult });
   }
 
   returnHome(): void {
@@ -1518,6 +2681,10 @@ export class SeattleScene extends Phaser.Scene {
   update(time: number, delta: number): void {
     if (!this.player || !this.keys) return;
     this.applyAtmosphere(delta);
+    if (this.gigSession) {
+      this.updateStreetGig(time);
+      return;
+    }
     const keyboardDirection =
       (this.keys.left.isDown || this.keys.a.isDown ? -1 : 0) +
       (this.keys.right.isDown || this.keys.d.isDown ? 1 : 0);
@@ -1598,6 +2765,7 @@ export class SeattleScene extends Phaser.Scene {
       this.triggerInteraction();
     }
 
+    this.updateFlyerCrowd(time, delta);
     this.updateStreetCrowd(time, delta);
     this.updateFocus();
     this.updateOpportunityCues(time);
@@ -1682,6 +2850,48 @@ export class SeattleScene extends Phaser.Scene {
     }
   }
 
+  private updateFlyerCrowd(time: number, delta: number): void {
+    const phase = this.snapshot.gig.phase;
+    const approached = new Set(this.snapshot.gig.approachedPeople);
+    const recruited = new Set(this.snapshot.gig.recruitedPeople);
+    const bounds = getOpenWorldBounds();
+
+    this.flyerProspects.forEach((prospect, index) => {
+      if (phase === "unbooked") {
+        prospect.container.setVisible(false);
+        return;
+      }
+      if (phase === "complete") {
+        prospect.container.setVisible(recruited.has(prospect.id));
+        prospect.leftLeg.setAngle(0);
+        prospect.rightLeg.setAngle(0);
+        return;
+      }
+      if (phase !== "promoting") return;
+
+      prospect.container.setVisible(true);
+      const slowedByFlyer = approached.has(prospect.id) ? 0.58 : 1;
+      const waitingForPitch = this.focusedProspect?.id === prospect.id;
+      if (!this.menuOpen && !waitingForPitch) {
+        prospect.container.x +=
+          prospect.direction * prospect.speed * slowedByFlyer * (delta / 1000);
+      }
+      if (prospect.container.x < bounds.minX + 100) {
+        prospect.container.x = bounds.maxX - 100;
+      } else if (prospect.container.x > bounds.maxX - 100) {
+        prospect.container.x = bounds.minX + 100;
+      }
+      prospect.figure.setScale(prospect.direction, 1);
+      const stride = this.menuOpen || waitingForPitch
+        ? 0
+        : Math.sin((time + prospect.phase) / 118) * 11 * slowedByFlyer;
+      prospect.leftLeg.setAngle(stride);
+      prospect.rightLeg.setAngle(-stride);
+      prospect.figure.y = Math.abs(Math.sin((time + prospect.phase) / 236)) * -1.5;
+      prospect.container.setDepth(25 + (index % 2));
+    });
+  }
+
   private playFootstep(time: number): void {
     if (time - this.lastFootstepAt < 310) return;
     this.audio.play("footstep");
@@ -1689,32 +2899,69 @@ export class SeattleScene extends Phaser.Scene {
   }
 
   private updateFocus(): void {
+    let nearestProspect: { prospect: FlyerProspectVisual; distance: number } | null = null;
+    if (
+      this.snapshot.gig.phase === "promoting" &&
+      this.snapshot.gig.flyersRemaining > 0
+    ) {
+      const approached = new Set(this.snapshot.gig.approachedPeople);
+      for (const prospect of this.flyerProspects) {
+        if (!prospect.container.visible || approached.has(prospect.id)) continue;
+        const distance = Math.abs(this.player.x - prospect.container.x);
+        if (
+          distance <= FLYER_INTERACTION_DISTANCE &&
+          (!nearestProspect || distance < nearestProspect.distance)
+        ) {
+          nearestProspect = { prospect, distance };
+        }
+      }
+    }
+
     let nearest: { id: LocationId; distance: number } | null = null;
-    for (const location of LOCATIONS.filter(
-      (item) => item.interactive && this.gameState.isLocationUnlocked(item.id),
-    )) {
-      const distance = Math.abs(this.player.x - location.x);
-      if (distance <= location.interactionRadius && (!nearest || distance < nearest.distance)) {
-        nearest = { id: location.id, distance };
+    if (!nearestProspect) {
+      for (const location of LOCATIONS.filter(
+        (item) => item.interactive && this.gameState.isLocationUnlocked(item.id),
+      )) {
+        const distance = Math.abs(this.player.x - location.x);
+        if (distance <= location.interactionRadius && (!nearest || distance < nearest.distance)) {
+          nearest = { id: location.id, distance };
+        }
       }
     }
 
     const nextFocus = nearest?.id ?? null;
-    if (nextFocus !== this.focusedLocation) {
+    const nextProspect = nearestProspect?.prospect ?? null;
+    const nextKey = nextProspect ? `prospect:${nextProspect.id}` : nextFocus ?? "none";
+    if (nextKey !== this.focusKey) {
       if (this.focusedLocation) {
         this.locationVisuals.get(this.focusedLocation)?.highlight.setVisible(false);
       }
+      this.focusKey = nextKey;
       this.focusedLocation = nextFocus;
+      this.focusedProspect = nextProspect;
       if (nextFocus) this.locationVisuals.get(nextFocus)?.highlight.setVisible(true);
       this.coffeeBubble.setVisible(nextFocus === "coffee" && !this.menuOpen);
       this.gameEvents.emit("focus", {
         locationId: nextFocus,
-        label: nextFocus ? `E / SPACE · ${LOCATION_BY_ID[nextFocus].name}` : "",
+        label: nextProspect
+          ? "E / SPACE · HAND OVER A FLYER"
+          : nextFocus
+            ? `E / SPACE · ${LOCATION_BY_ID[nextFocus].name}`
+            : "",
       });
     }
   }
 
   private updateOpportunityCues(time: number): void {
+    if (this.snapshot.gig.phase === "promoting" || this.snapshot.gig.phase === "performing") {
+      this.opportunityMarkers.forEach((marker) => marker.setVisible(false));
+      if (this.lastCueKey !== "gig") {
+        this.lastCueKey = "gig";
+        this.gameEvents.emit("cue", { opportunity: null, direction: null });
+      }
+      return;
+    }
+
     const active = this.gameState.opportunities.active();
     const selected = active[0] ?? null;
     if (selected) {

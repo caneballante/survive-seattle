@@ -7,6 +7,15 @@ export type SoundEffect =
   | "expansion"
   | "footstep";
 
+export type PerformanceCue =
+  | "beat"
+  | "accent"
+  | "perfect"
+  | "good"
+  | "miss"
+  | "coin"
+  | "flourish";
+
 interface SoundEffectDefinition {
   files: string[];
   volume: number;
@@ -14,6 +23,8 @@ interface SoundEffectDefinition {
 }
 
 const audioUrl = (path: string): string => new URL(path, document.baseURI).href;
+const AMBIENT_MUSIC_VOLUME = 0.16;
+const PERFORMANCE_MUSIC_VOLUME = 0.3;
 
 const EFFECTS: Record<SoundEffect, SoundEffectDefinition> = {
   "ui-click": {
@@ -61,11 +72,12 @@ export class AudioManager {
   private muted = false;
   private sequence = 0;
   private resumeAfterVisibilityChange = false;
+  private synthContext: AudioContext | null = null;
 
   constructor() {
     this.music.loop = true;
     this.music.preload = "auto";
-    this.music.volume = 0.16;
+    this.music.volume = AMBIENT_MUSIC_VOLUME;
     this.publishState("waiting");
 
     Object.values(EFFECTS).forEach(({ files }) => {
@@ -141,9 +153,44 @@ export class AudioManager {
       .catch(release);
   }
 
+  playPerformanceCue(cue: PerformanceCue): void {
+    if (!this.activated || this.muted || document.hidden) return;
+    const context = this.getSynthContext();
+    if (!context) return;
+    if (context.state === "suspended") void context.resume();
+
+    const tones: Record<PerformanceCue, Array<[number, number, number, OscillatorType, number?]>> = {
+      beat: [[330, 0.035, 0.018, "sine"]],
+      accent: [[110, 0.1, 0.04, "triangle", 82], [440, 0.045, 0.02, "square"]],
+      perfect: [[523, 0.17, 0.035, "triangle"], [659, 0.2, 0.03, "triangle"], [784, 0.24, 0.025, "sine"]],
+      good: [[392, 0.12, 0.026, "triangle"], [523, 0.15, 0.02, "sine"]],
+      miss: [[180, 0.18, 0.035, "sawtooth", 105]],
+      coin: [[880, 0.08, 0.028, "sine"], [1320, 0.12, 0.02, "sine"]],
+      flourish: [[196, 0.28, 0.04, "sawtooth", 392], [392, 0.3, 0.025, "triangle", 784]],
+    };
+    tones[cue].forEach(([frequency, duration, volume, type, endFrequency], index) => {
+      this.playTone(context, frequency, duration, volume, type, index * 0.018, endFrequency);
+    });
+  }
+
+  beginPerformance(): void {
+    this.music.volume = PERFORMANCE_MUSIC_VOLUME;
+    try {
+      this.music.currentTime = 0;
+    } catch {
+      // The file may still be loading; playback will begin at its earliest available frame.
+    }
+    void this.startMusic();
+  }
+
+  endPerformance(): void {
+    this.music.volume = AMBIENT_MUSIC_VOLUME;
+  }
+
   private readonly activateFromGesture = (): void => {
     if (this.activated) return;
     this.activated = true;
+    this.getSynthContext();
     this.publishState("starting");
     void this.startMusic();
     window.removeEventListener("pointerdown", this.activateFromGesture, {
@@ -169,6 +216,40 @@ export class AudioManager {
         capture: true,
       });
     }
+  }
+
+  private getSynthContext(): AudioContext | null {
+    if (this.synthContext) return this.synthContext;
+    try {
+      this.synthContext = new AudioContext();
+      return this.synthContext;
+    } catch {
+      return null;
+    }
+  }
+
+  private playTone(
+    context: AudioContext,
+    frequency: number,
+    duration: number,
+    volume: number,
+    type: OscillatorType,
+    delay: number,
+    endFrequency = frequency,
+  ): void {
+    const now = context.currentTime + delay;
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    oscillator.type = type;
+    oscillator.frequency.setValueAtTime(frequency, now);
+    oscillator.frequency.exponentialRampToValueAtTime(Math.max(1, endFrequency), now + duration);
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(volume, now + 0.008);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+    oscillator.connect(gain);
+    gain.connect(context.destination);
+    oscillator.start(now);
+    oscillator.stop(now + duration + 0.02);
   }
 
   private readonly handleVisibilityChange = (): void => {
